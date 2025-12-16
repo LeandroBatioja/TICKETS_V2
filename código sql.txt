@@ -1,0 +1,1263 @@
+código sql:
+CREATE TABLE usuarios (
+    id_usuario SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    rol VARCHAR(20) NOT NULL CHECK (rol IN ('cliente', 'operador')),
+    fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE tickets (
+    id_ticket SERIAL PRIMARY KEY,
+    id_usuario INT NOT NULL,
+    asunto VARCHAR(200) NOT NULL,
+    estado VARCHAR(20) NOT NULL CHECK (estado IN ('abierto', 'en_proceso', 'cerrado')),
+    prioridad VARCHAR(10) NOT NULL CHECK (prioridad IN ('baja', 'media', 'alta')),
+    fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_tickets_usuarios
+        FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario)
+);
+
+CREATE TABLE interacciones (
+    id_interaccion BIGSERIAL PRIMARY KEY,
+    id_ticket INT NOT NULL,
+    autor VARCHAR(20) NOT NULL CHECK (autor IN ('cliente', 'operador')),
+    mensaje TEXT NOT NULL,
+    fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_interacciones_tickets
+        FOREIGN KEY (id_ticket) REFERENCES tickets(id_ticket)
+);
+
+CREATE INDEX idx_interacciones_ticket_fecha
+ON interacciones (id_ticket, fecha_creacion);
+
+CREATE ROLE rol_api NOINHERIT LOGIN PASSWORD 'api_segura';
+CREATE ROLE rol_batch NOINHERIT LOGIN PASSWORD 'batch_segura';
+
+GRANT SELECT, INSERT, UPDATE ON usuarios TO rol_api;
+GRANT SELECT, INSERT, UPDATE ON tickets TO rol_api;
+GRANT SELECT, INSERT, UPDATE ON interacciones TO rol_api;
+
+REVOKE DELETE ON usuarios FROM rol_api;
+REVOKE DELETE ON tickets FROM rol_api;
+REVOKE DELETE ON interacciones FROM rol_api;
+
+GRANT SELECT ON usuarios TO rol_batch;
+GRANT SELECT ON tickets TO rol_batch;
+GRANT SELECT ON interacciones TO rol_batch;
+
+ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE interacciones ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY api_select_tickets
+ON tickets
+FOR SELECT
+TO rol_api
+USING (true);
+
+CREATE POLICY api_select_tickets
+ON tickets
+FOR SELECT
+TO rol_api
+USING (true);
+
+
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO rol_api, rol_batch;
+
+códigos del backend:
+
+database.py:
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = (
+    "postgresql+psycopg2://"
+    "rol_api.kcmmtuzwdfprxqqgvedk:"
+    "api_segura@"
+    "aws-0-us-west-2.pooler.supabase.com:6543/"
+    "postgres"
+)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
+Base = declarative_base()
+
+main.py:
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from enum import Enum
+
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
+
+from database import SessionLocal
+from models import Usuario, Ticket, Interaccion
+from redis_client import cache_usuario, enviar_tarea
+
+app = FastAPI(title="Sistema de Tickets con Batch Worker")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite todas las solicitudes de cualquier origen
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite todos los métodos HTTP
+    allow_headers=["*"],  # Permite todos los encabezados
+)
+
+
+# ======================================================
+# ENUMS (coinciden EXACTAMENTE con los CHECK de Supabase)
+# ======================================================
+
+class RolUsuario(str, Enum):
+    cliente = "cliente"
+    operador = "operador"
+
+class EstadoTicket(str, Enum):
+    abierto = "abierto"
+    en_proceso = "en_proceso"
+    cerrado = "cerrado"
+
+class PrioridadTicket(str, Enum):
+    baja = "baja"
+    media = "media"
+    alta = "alta"
+
+# ======================================================
+# DEPENDENCIA DE BASE DE DATOS
+# ======================================================
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ======================================================
+# CREAR USUARIO
+# ======================================================
+
+@app.post("/usuarios")
+def crear_usuario(
+    nombre: str,
+    email: str,
+    rol: RolUsuario,
+    db: Session = Depends(get_db)
+):
+    try:
+        usuario = Usuario(
+            nombre=nombre,
+            email=email,
+            rol=rol.value
+        )
+        db.add(usuario)
+        db.commit()
+        db.refresh(usuario)
+    except SQLAlchemyError as e:
+        db.rollback()
+        print("ERROR BD:", e)
+        raise HTTPException(status_code=500, detail="Error al crear usuario")
+
+    # Cache en Redis (no rompe si falla)
+    try:
+        cache_usuario(usuario.id_usuario, {
+            "id_usuario": usuario.id_usuario,
+            "nombre": usuario.nombre,
+            "rol": usuario.rol
+        })
+    except Exception:
+        pass
+
+    return usuario
+
+# ======================================================
+# CREAR TICKET
+# ======================================================
+
+@app.post("/tickets")
+def crear_ticket(
+    id_usuario: int,
+    asunto: str,
+    prioridad: PrioridadTicket,
+    db: Session = Depends(get_db)
+):
+    usuario = db.query(Usuario).filter(
+        Usuario.id_usuario == id_usuario
+    ).first()
+
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no existe")
+
+    try:
+        ticket = Ticket(
+            id_usuario=id_usuario,
+            asunto=asunto,
+            estado=EstadoTicket.abierto.value,
+            prioridad=prioridad.value
+        )
+        db.add(ticket)
+        db.commit()
+        db.refresh(ticket)
+    except SQLAlchemyError as e:
+        db.rollback()
+        print("ERROR BD:", e)
+        raise HTTPException(status_code=500, detail="Error al crear ticket")
+
+    # Enviar al batch worker
+    try:
+        enviar_tarea(ticket.id_ticket)
+    except Exception:
+        pass
+
+    return ticket
+
+# -----------------------
+# LISTAR TODOS LOS TICKETS (OPERADOR)
+# -----------------------
+@app.get("/tickets")
+def listar_tickets(db: Session = Depends(get_db)):
+    tickets = db.query(Ticket).order_by(Ticket.fecha_creacion.desc()).all()
+    return tickets
+
+# ======================================================
+# CAMBIAR ESTADO DEL TICKET (SOLO OPERADOR)
+# ======================================================
+
+@app.put("/tickets/{id_ticket}/estado")
+def cambiar_estado_ticket(
+    id_ticket: int,
+    nuevo_estado: EstadoTicket,
+    db: Session = Depends(get_db)
+):
+    ticket = db.query(Ticket).filter(
+        Ticket.id_ticket == id_ticket
+    ).first()
+
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket no encontrado")
+
+    try:
+        ticket.estado = nuevo_estado.value
+        db.commit()
+
+        interaccion = Interaccion(
+            id_ticket=id_ticket,
+            autor="operador",
+            mensaje=f"Estado actualizado a {nuevo_estado.value}"
+        )
+        db.add(interaccion)
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        print("ERROR BD:", e)
+        raise HTTPException(status_code=500, detail="Error al actualizar estado")
+
+    try:
+        enviar_tarea(id_ticket)
+    except Exception:
+        pass
+
+    return {"mensaje": "Estado actualizado correctamente"}
+
+# ======================================================
+# HISTORIAL DE INTERACCIONES
+# ======================================================
+
+@app.get("/tickets/{id_ticket}/historial")
+def historial_ticket(
+    id_ticket: int,
+    db: Session = Depends(get_db)
+):
+    historial = db.query(Interaccion).filter(
+        Interaccion.id_ticket == id_ticket
+    ).order_by(Interaccion.fecha_creacion.asc()).all()
+
+    return historial
+
+# -----------------------
+# LISTAR TODOS LOS TICKETS
+# -----------------------
+@app.get("/tickets")
+def listar_tickets(db: Session = Depends(get_db)):
+    try:
+        tickets = db.query(Ticket).all()
+        return tickets
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Error al obtener tickets")
+
+models.py:
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, TIMESTAMP
+from database import Base
+from sqlalchemy.sql import func
+
+class Usuario(Base):
+    __tablename__ = "usuarios"
+
+    id_usuario = Column(Integer, primary_key=True)
+    nombre = Column(String(100), nullable=False)
+    email = Column(String(150), nullable=False, unique=True)
+    rol = Column(String(20), nullable=False)
+    fecha_creacion = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+
+    id_ticket = Column(Integer, primary_key=True)
+    id_usuario = Column(Integer, ForeignKey("usuarios.id_usuario"))
+    asunto = Column(String(200), nullable=False)
+    estado = Column(String(20), nullable=False)
+    prioridad = Column(String(10), nullable=False)
+    fecha_creacion = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class Interaccion(Base):
+    __tablename__ = "interacciones"
+
+    id_interaccion = Column(Integer, primary_key=True)
+    id_ticket = Column(Integer, ForeignKey("tickets.id_ticket"))
+    autor = Column(String(20), nullable=False)
+    mensaje = Column(Text, nullable=False)
+    fecha_creacion = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+redis_client.py:
+import redis
+import json
+
+redis_client = redis.Redis(
+    host="redis-14630.c114.us-east-1-4.ec2.cloud.redislabs.com",
+    port=14630,
+    password="TU_PASSWORD_REDIS",
+    ssl=True,
+    decode_responses=True
+)
+
+def cache_usuario(id_usuario, data):
+    redis_client.setex(
+        f"usuario:{id_usuario}",
+        3600,
+        json.dumps(data)
+    )
+
+def enviar_tarea(id_ticket):
+    redis_client.rpush("cola_tickets", id_ticket)
+
+
+carpeta app:
+globals.css
+@import "tailwindcss";
+
+/* ===============================
+   COLORES BASE (PASTELES)
+================================ */
+:root {
+  --background: #f8fafc; /* gris pastel claro */
+  --foreground: #1e293b; /* slate oscuro */
+}
+
+/* ❌ ELIMINAMOS EL DARK MODE AUTOMÁTICO */
+/*
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+*/
+
+/* ===============================
+   ESTILO GLOBAL
+================================ */
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background: linear-gradient(
+    135deg,
+    #f8fafc 0%,
+    #eef2ff 50%,
+    #fdf2f8 100%
+  );
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+layout.tsx
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { AuthProvider } from "@/context/AuthContext";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "Create Next App",
+  description: "Generated by create next app",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+      >
+        {/* 🔐 CONTEXTO DE AUTENTICACIÓN / ROLES */}
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </body>
+    </html>
+  );
+}
+
+page.tsx:
+'use client';
+
+import { useEffect, useState } from 'react';
+import { Ticket } from '@/types/ticket';
+import { getTickets } from '@/lib/api';
+import TicketCard from '@/components/TicketCard';
+import DashboardStats from '@/components/DashboardStats';
+import NewTicketModal from '@/components/NewTicketModal';
+import { useAuth } from '@/context/AuthContext';
+
+export default function Page() {
+  const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [mostrarModal, setMostrarModal] = useState(false);
+  const { role, loading } = useAuth();
+
+  /* =========================
+     CARGAR TICKETS REALES
+  ========================== */
+  const refrescarTickets = async () => {
+    const data = await getTickets();
+    setTickets(data);
+  };
+
+  useEffect(() => {
+    refrescarTickets();
+  }, []);
+
+  /* =========================
+     ACTUALIZAR TICKET LOCAL
+  ========================== */
+  const actualizarTicket = (ticketActualizado: Ticket) => {
+    setTickets((prev) =>
+      prev.map((t) =>
+        t.id === ticketActualizado.id ? ticketActualizado : t
+      )
+    );
+  };
+
+  if (loading) return null;
+
+  return (
+    <main className="p-8 max-w-7xl mx-auto">
+
+      {/* HEADER */}
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-3xl font-bold text-slate-800">
+          🎫 Gestión de Tickets
+        </h1>
+          <button
+            onClick={() => setMostrarModal(true)}
+            className="px-4 py-2 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition"
+          >
+            ➕ Nuevo Ticket
+          </button>
+      </div>
+
+      {/* STATS */}
+      <DashboardStats tickets={tickets} />
+
+      {/* LISTA */}
+      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        {tickets.map((ticket) => (
+          <TicketCard
+            key={ticket.id}
+            ticket={ticket}
+            onUpdate={actualizarTicket}
+          />
+        ))}
+      </section>
+
+      {/* MODAL NUEVO TICKET */}
+      {mostrarModal && (
+        <NewTicketModal
+          onClose={() => setMostrarModal(false)}
+          onCreated={refrescarTickets} // 🔥 CONEXIÓN REAL
+        />
+      )}
+    </main>
+  );
+}
+
+fuera de app:
+components/DashboardStats.tsx:
+'use client';
+
+import { Ticket } from '../types/ticket';
+import {
+  TicketCheck,
+  Clock,
+  AlertTriangle,
+  ListChecks,
+} from 'lucide-react';
+
+interface Props {
+  tickets: Ticket[];
+}
+
+export default function DashboardStats({ tickets }: Props) {
+  const total = tickets.length;
+  const abiertos = tickets.filter(t => t.estado === 'Abierto').length;
+  const enProgreso = tickets.filter(t => t.estado === 'En Progreso').length;
+  const cerrados = tickets.filter(t => t.estado === 'Cerrado').length;
+
+  const stats = [
+    {
+      label: 'Total Tickets',
+      value: total,
+      icon: ListChecks,
+      color: 'bg-indigo-100 text-indigo-700',
+    },
+    {
+      label: 'Abiertos',
+      value: abiertos,
+      icon: AlertTriangle,
+      color: 'bg-blue-100 text-blue-700',
+    },
+    {
+      label: 'En Progreso',
+      value: enProgreso,
+      icon: Clock,
+      color: 'bg-yellow-100 text-yellow-700',
+    },
+    {
+      label: 'Cerrados',
+      value: cerrados,
+      icon: TicketCheck,
+      color: 'bg-green-100 text-green-700',
+    },
+  ];
+
+  return (
+    <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
+      {stats.map(({ label, value, icon: Icon, color }) => (
+        <div
+          key={label}
+          className="bg-white rounded-2xl shadow-sm p-5 hover:shadow-md transition-all"
+        >
+          <div className="flex items-center gap-4">
+            <div className={`p-3 rounded-xl ${color}`}>
+              <Icon size={22} />
+            </div>
+
+            <div>
+              <p className="text-sm text-slate-500">{label}</p>
+              <p className="text-2xl font-bold text-slate-800">{value}</p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+components/NewTicketModal.tsx:
+'use client';
+
+import { useState } from 'react';
+import { crearTicket } from '@/lib/api';
+
+interface Props {
+  onClose: () => void;
+  onCreated: () => void; // 🔹 refresca lista
+}
+
+export default function NewTicketModal({ onClose, onCreated }: Props) {
+  const [asunto, setAsunto] = useState('');
+  const [descripcion, setDescripcion] = useState('');
+  const [prioridad, setPrioridad] = useState<'baja' | 'media' | 'alta'>('media');
+  const [loading, setLoading] = useState(false);
+
+  /* =========================
+     CREAR TICKET REAL
+  ========================== */
+  const handleCrear = async () => {
+    if (!asunto.trim()) {
+      alert('El asunto es obligatorio');
+      return;
+    }
+
+    try {
+      setLoading(true);
+
+      await crearTicket({
+        id_usuario: 1, // ⚠️ ajusta si usas auth
+        asunto,
+        prioridad,
+      });
+
+      onCreated(); // 🔹 vuelve a pedir tickets reales
+      onClose();
+    } catch (error) {
+      alert('Error al crear ticket');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+      <div className="bg-white rounded-2xl shadow-lg w-full max-w-md p-6">
+
+        {/* HEADER */}
+        <h2 className="text-xl font-bold text-slate-800 mb-4">
+          ➕ Nuevo Ticket
+        </h2>
+
+        {/* FORM */}
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm text-slate-600 mb-1">
+              Asunto
+            </label>
+            <input
+              value={asunto}
+              onChange={(e) => setAsunto(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-300"
+              placeholder="Ej: Error al iniciar sesión"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm text-slate-600 mb-1">
+              Descripción
+            </label>
+            <textarea
+              value={descripcion}
+              onChange={(e) => setDescripcion(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-300"
+              rows={3}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm text-slate-600 mb-1">
+              Prioridad
+            </label>
+            <select
+              value={prioridad}
+              onChange={(e) => setPrioridad(e.target.value as any)}
+              className="w-full border rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-300"
+            >
+              <option value="baja">Baja</option>
+              <option value="media">Media</option>
+              <option value="alta">Alta</option>
+            </select>
+          </div>
+        </div>
+
+        {/* FOOTER */}
+        <div className="flex justify-end gap-3 mt-6">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 rounded-lg text-slate-600 hover:bg-slate-100"
+          >
+            Cancelar
+          </button>
+
+          <button
+            onClick={handleCrear}
+            disabled={loading}
+            className="px-4 py-2 rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 disabled:opacity-50"
+          >
+            {loading ? 'Creando...' : 'Crear Ticket'}
+          </button>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+components/TicketCard.tsx:
+'use client';
+
+import { useState } from 'react';
+import { Ticket, TicketPriority, TicketStatus } from '@/types/ticket';
+import { useAuth } from '@/context/AuthContext';
+
+interface Props {
+  ticket: Ticket;
+  onUpdate?: (ticket: Ticket) => void;
+}
+
+export default function TicketCard({ ticket, onUpdate }: Props) {
+  const [mostrarModal, setMostrarModal] = useState(false);
+  const [editando, setEditando] = useState(false);
+  const [ticketEditado, setTicketEditado] = useState<Ticket>(ticket);
+
+  const { role } = useAuth();
+
+  /* ===========================
+     GUARDAR CAMBIOS
+  =========================== */
+  const handleGuardar = () => {
+    onUpdate?.(ticketEditado);
+    setEditando(false);
+    setMostrarModal(false);
+  };
+
+  const handleCerrar = () => {
+    const cerrado: Ticket = {
+      ...ticketEditado,
+      estado: 'Cerrado',
+    };
+    setTicketEditado(cerrado);
+    onUpdate?.(cerrado);
+    setMostrarModal(false);
+  };
+
+  /* ===========================
+     COLORES (SIN TOCAR)
+  =========================== */
+  const estadoColors: Record<TicketStatus, string> = {
+    Abierto: 'bg-green-100 text-green-700',
+    'En Progreso': 'bg-blue-100 text-blue-700',
+    Cerrado: 'bg-gray-100 text-gray-700',
+    /*Rechazado: 'bg-red-100 text-red-700',*/
+  };
+
+  const prioridadColors: Record<TicketPriority, string> = {
+    Baja: 'bg-slate-100 text-slate-700',
+    Media: 'bg-yellow-100 text-yellow-700',
+    Alta: 'bg-orange-100 text-orange-700',
+    /*Urgente: 'bg-red-100 text-red-700',*/
+  };
+
+  return (
+    <>
+      {/* ===========================
+          CARD
+      =========================== */}
+      <div
+        onClick={() => setMostrarModal(true)}
+        className="bg-white rounded-2xl shadow-sm p-5 hover:shadow-md transition cursor-pointer"
+      >
+        <div className="flex gap-2 mb-3">
+          <span
+            className={`px-3 py-1 text-xs rounded-full ${estadoColors[ticket.estado]}`}
+          >
+            {ticket.estado}
+          </span>
+          <span
+            className={`px-3 py-1 text-xs rounded-full ${prioridadColors[ticket.prioridad]}`}
+          >
+            {ticket.prioridad}
+          </span>
+        </div>
+
+        <h3 className="font-semibold text-slate-800">
+          {ticket.asunto}
+        </h3>
+      </div>
+
+      {/* ===========================
+          MODAL (FONDO CORREGIDO)
+      =========================== */}
+      {mostrarModal && (
+        <div
+          className="fixed inset-0 bg-slate-100/80 backdrop-blur-sm flex items-center justify-center z-50"
+          onClick={() => setMostrarModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl w-full max-w-2xl p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-xl font-bold mb-4">
+              {editando ? '✏️ Editar Ticket' : '🎫 Detalles del Ticket'}
+            </h2>
+
+            {/* ===========================
+                ESTADO
+            =========================== */}
+            <label className="block text-sm mb-1">Estado</label>
+            {editando ? (
+              <select
+                value={ticketEditado.estado}
+                onChange={(e) =>
+                  setTicketEditado({
+                    ...ticketEditado,
+                    estado: e.target.value as TicketStatus,
+                  })
+                }
+                className="w-full border rounded-lg px-3 py-2 mb-3"
+              >
+                <option value="Abierto">Abierto</option>
+                <option value="En Progreso">En Progreso</option>
+                <option value="Cerrado">Cerrado</option>
+                <option value="Rechazado">Rechazado</option>
+              </select>
+            ) : (
+              <p className="mb-3">{ticketEditado.estado}</p>
+            )}
+
+            {/* ===========================
+                PRIORIDAD
+            =========================== */}
+            <label className="block text-sm mb-1">Prioridad</label>
+            {editando ? (
+              <select
+                value={ticketEditado.prioridad}
+                onChange={(e) =>
+                  setTicketEditado({
+                    ...ticketEditado,
+                    prioridad: e.target.value as TicketPriority,
+                  })
+                }
+                className="w-full border rounded-lg px-3 py-2 mb-3"
+              >
+                <option value="Baja">Baja</option>
+                <option value="Media">Media</option>
+                <option value="Alta">Alta</option>
+                <option value="Urgente">Urgente</option>
+              </select>
+            ) : (
+              <p className="mb-3">{ticketEditado.prioridad}</p>
+            )}
+
+            {/* ===========================
+                ASUNTO
+            =========================== */}
+            <label className="block text-sm mb-1">Asunto</label>
+            {editando ? (
+              <input
+                value={ticketEditado.asunto}
+                onChange={(e) =>
+                  setTicketEditado({
+                    ...ticketEditado,
+                    asunto: e.target.value,
+                  })
+                }
+                className="w-full border rounded-lg px-3 py-2 mb-3"
+              />
+            ) : (
+              <p className="mb-3">{ticketEditado.asunto}</p>
+            )}
+
+            {/* ===========================
+                DESCRIPCIÓN
+            =========================== */}
+            <label className="block text-sm mb-1">Descripción</label>
+            {editando ? (
+              <textarea
+                value={ticketEditado.descripcion}
+                onChange={(e) =>
+                  setTicketEditado({
+                    ...ticketEditado,
+                    descripcion: e.target.value,
+                  })
+                }
+                rows={4}
+                className="w-full border rounded-lg px-3 py-2 mb-4"
+              />
+            ) : (
+              <p className="mb-4">{ticketEditado.descripcion}</p>
+            )}
+
+            {/* ===========================
+                BOTONES (ROLES)
+            =========================== */}
+            <div className="flex gap-3 justify-end">
+              {role !== 'cliente' && !editando && (
+                <button
+                  onClick={() => setEditando(true)}
+                  className="px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg"
+                >
+                  ✏️ Editar
+                </button>
+              )}
+
+              {editando && (
+                <button
+                  onClick={handleGuardar}
+                  className="px-4 py-2 bg-indigo-600 text-white rounded-lg"
+                >
+                  💾 Guardar
+                </button>
+              )}
+
+              {role === 'admin' && ticketEditado.estado !== 'Cerrado' && (
+                <button
+                  onClick={handleCerrar}
+                  className="px-4 py-2 bg-green-100 text-green-700 rounded-lg"
+                >
+                  ✓ Cerrar Ticket
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+components/TicketChat.tsx:
+'use client';
+
+import { Interaccion } from '@/types/interacciones';
+
+interface Props {
+  historial: Interaccion[];
+}
+
+export default function TicketChat({ historial }: Props) {
+  return (
+    <div className="border rounded-xl p-4 bg-slate-50 max-h-64 overflow-y-auto space-y-3">
+      {historial.map((msg) => (
+        <div
+          key={msg.id_interaccion}
+          className={`flex ${
+            msg.autor === 'operador'
+              ? 'justify-end'
+              : 'justify-start'
+          }`}
+        >
+          <div
+            className={`max-w-[75%] px-4 py-2 rounded-xl text-sm ${
+              msg.autor === 'operador'
+                ? 'bg-indigo-600 text-white'
+                : 'bg-white border'
+            }`}
+          >
+            <p className="font-semibold mb-1 capitalize">
+              {msg.autor}
+            </p>
+            <p>{msg.mensaje}</p>
+            <p className="text-[10px] opacity-70 mt-1 text-right">
+              {new Date(msg.fecha_creacion).toLocaleString()}
+            </p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+components/TicketFilters.tsx:
+'use client';
+
+import { TicketStatus, TicketPriority } from '@/types/ticket';
+
+interface Props {
+  estado: TicketStatus | 'Todos';
+  prioridad: TicketPriority | 'Todas';
+  onChange: (filters: {
+    estado: TicketStatus | 'Todos';
+    prioridad: TicketPriority | 'Todas';
+  }) => void;
+}
+
+export default function TicketFilter({
+  estado,
+  prioridad,
+  onChange,
+}: Props) {
+  return (
+    <div className="bg-white rounded-2xl shadow-sm p-5 mb-6 flex flex-col sm:flex-row gap-4">
+
+      {/* FILTRO ESTADO */}
+      <div className="flex-1">
+        <label className="block text-sm font-medium text-slate-600 mb-1">
+          Estado
+        </label>
+        <select
+          value={estado}
+          onChange={(e) =>
+            onChange({
+              estado: e.target.value as any,
+              prioridad,
+            })
+          }
+          className="w-full border rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-300"
+        >
+          <option value="Todos">Todos</option>
+          <option value="Abierto">Abierto</option>
+          <option value="En Progreso">En Progreso</option>
+          <option value="Cerrado">Cerrado</option>
+          <option value="Rechazado">Rechazado</option>
+        </select>
+      </div>
+
+      {/* FILTRO PRIORIDAD */}
+      <div className="flex-1">
+        <label className="block text-sm font-medium text-slate-600 mb-1">
+          Prioridad
+        </label>
+        <select
+          value={prioridad}
+          onChange={(e) =>
+            onChange({
+              estado,
+              prioridad: e.target.value as any,
+            })
+          }
+          className="w-full border rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-300"
+        >
+          <option value="Todas">Todas</option>
+          <option value="Baja">Baja</option>
+          <option value="Media">Media</option>
+          <option value="Alta">Alta</option>
+          <option value="Urgente">Urgente</option>
+        </select>
+      </div>
+    </div>
+  );
+}
+
+context/AuthContext.tsx:
+'use client';
+
+import { createContext, useContext, useEffect, useState } from 'react';
+import { User, UserRole } from '@/types/users';
+
+interface AuthContextType {
+  user: User | null;
+  role: UserRole | null;
+  loading: boolean;
+}
+
+const AuthContext = createContext<AuthContextType>({
+  user: null,
+  role: null,
+  loading: true,
+});
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [role, setRole] = useState<UserRole | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // 🔐 SIMULADO (luego se conecta al backend real)
+    const usuarioSimulado: User = {
+      id: 1,
+      nombre: 'Administrador',
+      rol: 'admin', // admin | operador | cliente
+    };
+
+    setUser(usuarioSimulado);
+    setRole(usuarioSimulado.rol);
+    setLoading(false);
+  }, []);
+
+  return (
+    <AuthContext.Provider value={{ user, role, loading }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+
+lib/api.ts:
+import { Ticket } from '@/types/ticket';
+
+const API_URL = 'http://127.0.0.1:8000';
+
+/* ============================
+   USUARIO ACTUAL
+============================ */
+export async function getUsuarioActual(): Promise<any> {
+  const res = await fetch(`${API_URL}/me`, {
+    cache: 'no-store',
+  });
+
+  if (!res.ok) {
+    throw new Error('No autenticado');
+  }
+
+  return res.json();
+}
+
+/* ================= BACKEND ================= */
+interface TicketBackend {
+  id_ticket: number;
+  asunto: string;
+  prioridad: 'baja' | 'media' | 'alta';
+  estado: 'abierto' | 'en_proceso' | 'cerrado';
+  fecha_creacion: string;
+}
+
+/* ================= MAPPER ================= */
+function mapTicket(t: TicketBackend): Ticket {
+  return {
+    id: String(t.id_ticket),
+    asunto: t.asunto,
+    descripcion: '',
+    prioridad:
+      t.prioridad.charAt(0).toUpperCase() +
+      t.prioridad.slice(1) as Ticket['prioridad'],
+
+    estado:
+      t.estado === 'en_proceso'
+        ? 'En Progreso'
+        : t.estado.charAt(0).toUpperCase() +
+          t.estado.slice(1) as Ticket['estado'],
+
+    fechaCreacion: new Date(t.fecha_creacion),
+  };
+}
+
+/* ================= API ================= */
+export async function getTickets(): Promise<Ticket[]> {
+  const res = await fetch(`${API_URL}/tickets`, {
+    cache: 'no-store',
+  });
+
+  if (!res.ok) {
+    throw new Error('Error al obtener tickets');
+  }
+
+  const data: TicketBackend[] = await res.json();
+  return data.map(mapTicket);
+}
+
+export async function crearTicket(data: {
+  id_usuario: number;
+  asunto: string;
+  prioridad: 'baja' | 'media' | 'alta';
+}) {
+  const params = new URLSearchParams({
+    id_usuario: String(data.id_usuario),
+    asunto: data.asunto,
+    prioridad: data.prioridad,
+  });
+
+  const res = await fetch(`${API_URL}/tickets?${params}`, {
+    method: 'POST',
+  });
+
+  if (!res.ok) {
+    throw new Error('Error al crear ticket');
+  }
+
+  return res.json();
+}
+
+export async function cambiarEstadoTicket(
+  id: string,
+  nuevoEstado: 'abierto' | 'en_proceso' | 'cerrado'
+) {
+  const res = await fetch(
+    `${API_URL}/tickets/${id}/estado?nuevo_estado=${nuevoEstado}`,
+    { method: 'PUT' }
+  );
+
+  if (!res.ok) {
+    throw new Error('Error al cambiar estado');
+  }
+
+  return res.json();
+}
+
+import { Interaccion } from '@/types/interacciones';
+
+export async function getHistorialTicket(
+  idTicket: string
+): Promise<Interaccion[]> {
+  const res = await fetch(
+    `${API_URL}/tickets/${idTicket}/historial`,
+    { cache: 'no-store' }
+  );
+
+  if (!res.ok) {
+    throw new Error('Error al obtener historial');
+  }
+
+  return res.json();
+}
+
+types/interacciones.ts:
+export type AutorInteraccion = 'cliente' | 'operador';
+
+export interface Interaccion {
+  id_interaccion: number;
+  autor: AutorInteraccion;
+  mensaje: string;
+  fecha_creacion: string;
+}
+
+types/tickets.ts:
+export type TicketStatus =
+  | 'Abierto'
+  | 'En Progreso'
+  | 'Cerrado';
+
+export type TicketPriority =
+  | 'Baja'
+  | 'Media'
+  | 'Alta';
+
+export interface Ticket {
+  id: string;
+  asunto: string;
+  descripcion: string;
+  prioridad: TicketPriority;
+  estado: TicketStatus;
+  fechaCreacion: Date;
+}
+
+export type UserRole = 'admin' | 'operador' | 'cliente';
+
+export interface User {
+  id: number;
+  nombre: string;
+  rol: UserRole;
+}
+
+types/users.ts
+export type UserRole = 'admin' | 'operador' | 'cliente';
+
+export interface User {
+  id: number;
+  nombre: string;
+  rol: UserRole;
+}
+
+
+
+
+

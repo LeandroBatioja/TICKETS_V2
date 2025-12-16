@@ -1,3 +1,4 @@
+// app/page.tsx
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -7,53 +8,71 @@ import TicketCard from '@/components/TicketCard';
 import DashboardStats from '@/components/DashboardStats';
 import NewTicketModal from '@/components/NewTicketModal';
 import { useAuth } from '@/context/AuthContext';
+import { useRouter } from 'next/navigation'; // <-- AGREGAR ESTA IMPORTACIÓN
 
 export default function Page() {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [mostrarModal, setMostrarModal] = useState(false);
-  const { role, loading } = useAuth();
+  const { user, role, loading, logout } = useAuth(); 
+  const router = useRouter(); 
 
   /* =========================
-     CARGAR TICKETS REALES
+     PROTECCIÓN DE RUTA
+  ========================== */
+  useEffect(() => {
+    if (!loading && !user) {
+      router.push('/login'); // Redirige a login si no hay usuario
+    }
+  }, [loading, user, router]);
+
+  /* =========================
+     CARGAR TICKETS
   ========================== */
   const refrescarTickets = async () => {
-    const data = await getTickets();
-    setTickets(data);
+    if (user) {
+      const data = await getTickets();
+      setTickets(data);
+    }
   };
 
   useEffect(() => {
-    refrescarTickets();
-  }, []);
+      if (user) {
+          refrescarTickets();
+      }
+  }, [user]); 
 
-  /* =========================
-     ACTUALIZAR TICKET LOCAL
-  ========================== */
-  const actualizarTicket = (ticketActualizado: Ticket) => {
-    setTickets((prev) =>
-      prev.map((t) =>
-        t.id === ticketActualizado.id ? ticketActualizado : t
-      )
-    );
+  const actualizarTicket = async (updatedTicket: Ticket) => {
+    // ... (El resto de esta función se mantiene igual)
   };
 
-  if (loading) return null;
+  // Bloquea el renderizado si no hay usuario o está cargando
+  if (loading || !user) return null; 
 
   return (
     <main className="p-8 max-w-7xl mx-auto">
 
+      {/* BOTÓN DE CERRAR SESIÓN */}
+      <button
+        onClick={logout}
+        className="fixed top-4 right-4 px-4 py-2 bg-red-500 text-white rounded-xl hover:bg-red-600 transition"
+      >
+        Cerrar Sesión ({user.rol})
+      </button>
+
       {/* HEADER */}
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-3xl font-bold text-slate-800">
-          🎫 Gestión de Tickets
+          🎫 Gestión de Tickets (Usuario: {user.nombre})
         </h1>
-          <button
-            onClick={() => setMostrarModal(true)}
-            className="px-4 py-2 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition"
-          >
-            ➕ Nuevo Ticket
-          </button>
+        {/* Usando el color principal: bg-indigo-600 */}
+        <button
+          onClick={() => setMostrarModal(true)}
+          className="px-4 py-2 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition"
+        >
+          ➕ Nuevo Ticket
+        </button>
       </div>
-
+      
       {/* STATS */}
       <DashboardStats tickets={tickets} />
 
@@ -72,7 +91,7 @@ export default function Page() {
       {mostrarModal && (
         <NewTicketModal
           onClose={() => setMostrarModal(false)}
-          onCreated={refrescarTickets} // 🔥 CONEXIÓN REAL
+          onCreated={refrescarTickets} 
         />
       )}
     </main>
