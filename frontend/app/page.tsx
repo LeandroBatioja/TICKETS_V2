@@ -65,7 +65,7 @@ export default function Page() {
       {/* HEADER */}
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-3xl font-bold text-slate-800">
-          🎫 Gestión de Tickets (Usuario: {user.nombre} | Rol: {role})
+          🎫 Gestión de Tickets (Rol: {role})
         </h1>
         
         {/* LÓGICA DE VISIBILIDAD: SOLO EL OPERADOR PUEDE CREAR TICKET */}
