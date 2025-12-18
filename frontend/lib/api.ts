@@ -3,7 +3,7 @@ import { Ticket } from '@/types/ticket';
 import { User, UserRole } from '@/types/users'; 
 import { Interaccion } from '@/types/interacciones';
 
-const API_URL = 'http://127.0.0.1:8000';
+const API_URL = '/api';
 
 /* ======================================================
    AUTENTICACIÓN (Se mantiene la funcionalidad de la DB)

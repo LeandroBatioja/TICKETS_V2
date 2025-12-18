@@ -32,8 +32,7 @@ app.add_middleware(
 
 # Define la URL de conexión a tu base de datos PostgreSQL
 # Asegúrate de que esta URL sea correcta.
-DATABASE_URL = "postgresql://postgres.kcmmtuzwdfprxqqgvedk:Pucese_74086477@aws-0-us-west-2.pooler.supabase.com:6543/postgres" 
-
+DATABASE_URL = "postgresql://postgres.kcmmtuzwdfprxqqgvedk:Pucese_74086477@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
