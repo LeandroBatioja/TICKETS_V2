@@ -63,7 +63,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = () => {
     setUser(null);
     setRole(null);
-    router.push('/login'); 
+    router.push('/api/login'); 
   };
 
   return (

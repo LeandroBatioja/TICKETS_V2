@@ -21,7 +21,7 @@ export default function Page() {
   ========================== */
   useEffect(() => {
     if (!loading && !user) {
-      router.push('/login'); 
+      router.push('/api/login'); 
     }
   }, [loading, user, router]);
 

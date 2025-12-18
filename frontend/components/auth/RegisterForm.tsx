@@ -27,7 +27,7 @@ export default function RegisterForm() {
     try {
       await registerUser(nombre, email, rol); // Llama a la API para insertar en la BD
       alert('Registro exitoso. ¡Inicia sesión con tu nuevo email!');
-      router.push('/login');
+      router.push('/api/login');
     } catch (err: any) {
       setError(err.message || 'Error desconocido al registrar');
     } finally {
