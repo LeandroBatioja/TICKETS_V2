@@ -142,7 +142,7 @@ class TicketCreateOperator(BaseModel):
 # ENDPOINTS DE AUTENTICACIÓN
 # ======================================================
 
-@app.post("/auth/register")
+@app.post("/api/auth/register")
 def register_user(usuario_data: UsuarioCreate, db: Session = Depends(get_db)):
     existing_user = db.query(Usuario).filter(Usuario.email == usuario_data.email).first()
     if existing_user:
@@ -160,14 +160,14 @@ def register_user(usuario_data: UsuarioCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Error al registrar usuario en la base de datos")
     return {"mensaje": "Registro exitoso", "id_usuario": usuario.id_usuario, "rol": usuario.rol}
 
-@app.post("/auth/login")
+@app.post("/api//auth/login")
 def login_user(usuario_login: UsuarioLogin, db: Session = Depends(get_db)):
     usuario = db.query(Usuario).filter(Usuario.email == usuario_login.email).first()
     if not usuario:
         raise HTTPException(status_code=401, detail="Credenciales inválidas (Email no encontrado)") 
     return {"mensaje": "Inicio de sesión exitoso", "id": usuario.id_usuario, "nombre": usuario.nombre, "rol": usuario.rol}
     
-@app.get("/me")
+@app.get("/api//me")
 def get_current_user(db: Session = Depends(get_db)):
     # Busca el primer usuario para simular el usuario logeado si no hay una gestión de sesión real
     usuario_simulado = db.query(Usuario).first() 
@@ -181,7 +181,7 @@ def get_current_user(db: Session = Depends(get_db)):
 # ======================================================
 
 # 1. LISTAR TICKETS SEGÚN ROL (GET /tickets)
-@app.get("/tickets")
+@app.get("/api//tickets")
 def listar_tickets(
     user_id: int, 
     user_role: RolUsuario,
@@ -205,7 +205,7 @@ def listar_tickets(
         raise HTTPException(status_code=500, detail="Error al obtener tickets de la base de datos.")
 
 # 2. CREAR TICKET (POST /tickets) - EXCLUSIVO PARA OPERADORES
-@app.post("/tickets")
+@app.post("/api//tickets")
 def crear_ticket(
     operator_id: int, 
     ticket_data: TicketCreateOperator,
@@ -273,7 +273,7 @@ def crear_ticket(
 
 
 # 3. CAMBIAR ESTADO TICKET (PUT /tickets/{id}/estado)
-@app.put("/tickets/{id}/estado")
+@app.put("/api//tickets/{id}/estado")
 def cambiar_estado_ticket(id: int, nuevo_estado: EstadoTicket, db: Session = Depends(get_db)):
     """
     Cambia el estado de un ticket y registra la interacción.
@@ -308,7 +308,7 @@ def cambiar_estado_ticket(id: int, nuevo_estado: EstadoTicket, db: Session = Dep
 # -----------------------
 # CAMBIAR PRIORIDAD TICKET (PUT /tickets/{id}/prioridad)
 # -----------------------
-@app.put("/tickets/{id}/prioridad")
+@app.put("/api//tickets/{id}/prioridad")
 def cambiar_prioridad_ticket(id: int, nueva_prioridad: PrioridadTicket, db: Session = Depends(get_db)):
     """
     Cambia la prioridad de un ticket y registra la interacción.
@@ -347,7 +347,7 @@ def cambiar_prioridad_ticket(id: int, nueva_prioridad: PrioridadTicket, db: Sess
 
 
 # 4. HISTORIAL TICKET (GET /tickets/{id_ticket}/historial)
-@app.get("/tickets/{id_ticket}/historial")
+@app.get("/api//tickets/{id_ticket}/historial")
 def historial_ticket(id_ticket: int, db: Session = Depends(get_db)):
     """
     Obtiene el historial de interacciones de un ticket.
